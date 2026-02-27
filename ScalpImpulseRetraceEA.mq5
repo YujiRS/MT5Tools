@@ -1,18 +1,18 @@
 ﻿//+------------------------------------------------------------------+
 //| ScalpImpulseRetraceEA.mq5                                        |
-//| ScalpImpulseRetraceEA v1.2                                       |
-//| SoftGate廃止・EnableTrading=Entry可否制御(CHANGE-004)              |
+//| ScalpImpulseRetraceEA v1.3                                       |
+//| EntryGate市場別化・SLATRMult Input化(CHANGE-005)                   |
 //+------------------------------------------------------------------+
 #property copyright "ScalpImpulseRetraceEA"
 #property link      ""
-#property version   "1.20"
+#property version   "1.30"
 #property strict
 
 //+------------------------------------------------------------------+
 //| 定数定義                                                          |
 //+------------------------------------------------------------------+
 #define EA_NAME           "ScaEA"
-#define EA_VERSION        "v1.2"
+#define EA_VERSION        "v1.3"
 
 //+------------------------------------------------------------------+
 //| Enum定義（第1章・第3章・第12章）                                    |
@@ -125,16 +125,16 @@ input string            SoundFileName            = "alert.wav";   // terminal/So
 
 // === TrendFilter / ReversalGuard (順張り方向フィルタ) ===
 input bool   TrendFilter_Enable          = true;
-input double TrendSlopeMult_FX           = 0.05;   // ATR(M15)*mult
-input double TrendSlopeMult_GOLD         = 0.07;   // ATR(M15)*mult
-input double TrendATRFloorPts_GOLD       = 80.0;   // ATR(M15) in points floor
-input double TrendSlopeMult_CRYPTO       = 0.04;   // ATR(M15)*mult
+input double TrendSlopeMult_FX           = 0.05;   // FX ATR(M15)*mult
+input double TrendSlopeMult_GOLD         = 0.07;   // GOLD ATR(M15)*mult
+input double TrendATRFloorPts_GOLD       = 80.0;   // GOLD ATR(M15) in points floor
+input double TrendSlopeMult_CRYPTO       = 0.04;   // CRYPTO ATR(M15)*mult
 
 input bool   ReversalGuard_Enable        = true;
 input bool   ReversalEngulfing_Enable    = true;
-input double ReversalBigBodyMult_FX      = 0.9;    // ATR(H1)*mult
-input double ReversalBigBodyMult_GOLD    = 1.0;    // ATR(H1)*mult
-input double ReversalBigBodyMult_CRYPTO  = 0.9;    // ATR(H1)*mult
+input double ReversalBigBodyMult_FX      = 0.9;    // FX ATR(H1)*mult
+input double ReversalBigBodyMult_GOLD    = 1.0;    // GOLD ATR(H1)*mult
+input double ReversalBigBodyMult_CRYPTO  = 0.9;    // CRYPTO ATR(H1)*mult
 input bool   ReversalWickReject_Enable_GOLD = true;
 input double ReversalWickRatioMin_GOLD   = 0.60;
 
@@ -148,8 +148,16 @@ input double            SpreadMult_CRYPTO      = 3.0;           // SpreadMult_CR
 input double            InputMaxSlippagePts    = 0;             // MaxSlippagePts(0=市場別デフォルト)
 input double            InputMaxFillDeviationPts = 0;           // MaxFillDeviationPts(0=市場別デフォルト)
 input double            InputMaxSpreadPts      = 0;             // MaxSpreadPts(FIXED時)
-input double            MinRR_EntryGate        = 0.8;           // MinRR_EntryGate(Entry待ち中の最低リスクリワード)
-input double            MinRangeCostMult       = 3.0;           // MinRangeCostMult(0-100幅がコスト合計の何倍未満なら失効)
+// --- EntryGate: RR / RangeCost / SL倍率（市場別） ---
+input double            MinRR_EntryGate_FX      = 0.7;           // MinRR_EntryGate_FX
+input double            MinRR_EntryGate_GOLD    = 0.6;           // MinRR_EntryGate_GOLD
+input double            MinRR_EntryGate_CRYPTO  = 0.5;           // MinRR_EntryGate_CRYPTO
+input double            MinRangeCostMult_FX     = 2.5;           // MinRangeCostMult_FX
+input double            MinRangeCostMult_GOLD   = 2.5;           // MinRangeCostMult_GOLD
+input double            MinRangeCostMult_CRYPTO = 2.0;           // MinRangeCostMult_CRYPTO
+input double            SLATRMult_FX            = 0.7;           // SLATRMult_FX(SL=ImpulseStart±ATR*this)
+input double            SLATRMult_GOLD          = 0.8;           // SLATRMult_GOLD
+input double            SLATRMult_CRYPTO        = 0.7;           // SLATRMult_CRYPTO
 
 // 【G3：戦略（基本触らない）】
 input bool              OptionalBand38         = false;          // OptionalBand38
@@ -216,6 +224,11 @@ struct MarketProfileData
 
    // CRYPTO: MicroBreak LookbackBars
    int               lookbackMicroBars;
+
+   // === EntryGate: 市場別RR/RangeCost/SL倍率 ===
+   double            slATRMult;               // SL = ImpulseStart ± ATR × this
+   double            minRR_EntryGate;         // 最低リスクリワード
+   double            minRangeCostMult;        // 最低コスト倍率
 };
 
 // === ANALYZE追加 === ImpulseSummary構造体
@@ -556,7 +569,7 @@ void InitMarketProfile()
          g_profile.optionalBand38          = OptionalBand38;
          g_profile.leaveDistanceMult       = 1.5;
          g_profile.leaveMinBars            = 1;       // BT の改善提案で 2->1 2026/02/22
-         g_profile.retouchTimeLimitBars    = 30;
+         g_profile.retouchTimeLimitBars    = 35;
          g_profile.resetMinBars            = 10;
          g_profile.confirmTimeLimitBars    = 6;
          g_profile.maxSlippagePts          = (InputMaxSlippagePts > 0) ? InputMaxSlippagePts : 2.0;
@@ -567,6 +580,9 @@ void InitMarketProfile()
          g_profile.overextensionMult       = 0.0;  // N/A
          g_profile.wickRatioMin            = 0.0;  // FXはWickRejection不採用
          g_profile.lookbackMicroBars       = 0;    // FXはフラクタル型
+         g_profile.slATRMult               = SLATRMult_FX;
+         g_profile.minRR_EntryGate         = MinRR_EntryGate_FX;
+         g_profile.minRangeCostMult        = MinRangeCostMult_FX;
          break;
 
       case MARKET_MODE_GOLD:
@@ -579,7 +595,7 @@ void InitMarketProfile()
          g_profile.optionalBand38          = false;   // GOLDは38.2帯なし
          g_profile.leaveDistanceMult       = 1.5;     // BT の改善提案で 2.0 -> 1.5 2026/02/22
          g_profile.leaveMinBars            = 1;       // BT の改善提案で 2->1 2026/02/22
-         g_profile.retouchTimeLimitBars    = 25;
+         g_profile.retouchTimeLimitBars    = 30;
          g_profile.resetMinBars            = 8;
          g_profile.confirmTimeLimitBars    = 5;
          g_profile.maxSlippagePts          = (InputMaxSlippagePts > 0) ? InputMaxSlippagePts : 5.0;
@@ -590,6 +606,9 @@ void InitMarketProfile()
          g_profile.overextensionMult       = 2.5;   // 第6章
          g_profile.wickRatioMin            = 0.55;  // 第7章
          g_profile.lookbackMicroBars       = 0;     // GOLDはフラクタル型
+         g_profile.slATRMult               = SLATRMult_GOLD;
+         g_profile.minRR_EntryGate         = MinRR_EntryGate_GOLD;
+         g_profile.minRangeCostMult        = MinRangeCostMult_GOLD;
          break;
 
       case MARKET_MODE_CRYPTO:
@@ -602,7 +621,7 @@ void InitMarketProfile()
          g_profile.optionalBand38          = OptionalBand38;
          g_profile.leaveDistanceMult       = 1.2;
          g_profile.leaveMinBars            = 1;
-         g_profile.retouchTimeLimitBars    = 18;
+         g_profile.retouchTimeLimitBars    = 25;
          g_profile.resetMinBars            = 6;
          g_profile.confirmTimeLimitBars    = 4;
          g_profile.maxSlippagePts          = (InputMaxSlippagePts > 0) ? InputMaxSlippagePts : 8.0;
@@ -613,6 +632,9 @@ void InitMarketProfile()
          g_profile.overextensionMult       = 0.0;   // N/A
          g_profile.wickRatioMin            = 0.0;   // CRYPTOはWickRejection不採用
          g_profile.lookbackMicroBars       = 3;     // 第7章
+         g_profile.slATRMult               = SLATRMult_CRYPTO;
+         g_profile.minRR_EntryGate         = MinRR_EntryGate_CRYPTO;
+         g_profile.minRangeCostMult        = MinRangeCostMult_CRYPTO;
          break;
 
       default:
@@ -2480,56 +2502,19 @@ bool ExecuteEntry()
 void CalculateSLTP(double entryPrice)
 {
    // SL: 構造（Impulse起点/直近スイング外）で決める
-   // 第9.1章: 市場別例
+   // 第9.1章: 市場別パラメータ → g_profile.slATRMult
    double atr = GetATR_M1(0);
+   double mult = g_profile.slATRMult;
 
-   switch(g_resolvedMarketMode)
+   if(g_impulseDir == DIR_LONG)
    {
-      case MARKET_MODE_FX:
-      {
-         // FX: 直近スイング外
-         if(g_impulseDir == DIR_LONG)
-         {
-            g_sl = g_impulseStart - atr * 0.5;
-            g_tp = g_impulseEnd;
-         }
-         else
-         {
-            g_sl = g_impulseStart + atr * 0.5;
-            g_tp = g_impulseEnd;
-         }
-         break;
-      }
-      case MARKET_MODE_GOLD:
-      {
-         // GOLD: スイープ想定し"少し外"
-         if(g_impulseDir == DIR_LONG)
-         {
-            g_sl = g_impulseStart - atr * 0.8;
-            g_tp = g_impulseEnd;
-         }
-         else
-         {
-            g_sl = g_impulseStart + atr * 0.8;
-            g_tp = g_impulseEnd;
-         }
-         break;
-      }
-      case MARKET_MODE_CRYPTO:
-      {
-         // CRYPTO: 広め前提
-         if(g_impulseDir == DIR_LONG)
-         {
-            g_sl = g_impulseStart - atr * 1.0;
-            g_tp = g_impulseEnd;
-         }
-         else
-         {
-            g_sl = g_impulseStart + atr * 1.0;
-            g_tp = g_impulseEnd;
-         }
-         break;
-      }
+      g_sl = g_impulseStart - atr * mult;
+      g_tp = g_impulseEnd;
+   }
+   else
+   {
+      g_sl = g_impulseStart + atr * mult;
+      g_tp = g_impulseEnd;
    }
 }
 
@@ -2537,21 +2522,9 @@ void CalculateSLTP(double entryPrice)
 void PreviewSLTP(double entryPrice, double &outSL, double &outTP)
 {
    double atr = GetATR_M1(0);
+   double mult = g_profile.slATRMult;
    outTP = g_impulseEnd;
-
-   switch(g_resolvedMarketMode)
-   {
-      case MARKET_MODE_FX:
-         outSL = (g_impulseDir == DIR_LONG) ? (g_impulseStart - atr * 0.5) : (g_impulseStart + atr * 0.5);
-         break;
-      case MARKET_MODE_GOLD:
-         outSL = (g_impulseDir == DIR_LONG) ? (g_impulseStart - atr * 0.8) : (g_impulseStart + atr * 0.8);
-         break;
-      case MARKET_MODE_CRYPTO:
-      default:
-         outSL = (g_impulseDir == DIR_LONG) ? (g_impulseStart - atr * 1.0) : (g_impulseStart + atr * 1.0);
-         break;
-   }
+   outSL = (g_impulseDir == DIR_LONG) ? (g_impulseStart - atr * mult) : (g_impulseStart + atr * mult);
 }
 
 //+------------------------------------------------------------------+
@@ -3160,22 +3133,19 @@ void Process_IMPULSE_CONFIRMED()
       double _point = SymbolInfoDouble(Symbol(), SYMBOL_POINT);
       double _spread = SymbolInfoDouble(Symbol(), SYMBOL_ASK) - SymbolInfoDouble(Symbol(), SYMBOL_BID);
 
-      if(g_resolvedMarketMode == MARKET_MODE_FX)
-         _sl = (g_impulseDir == DIR_LONG) ? (g_impulseStart - _atr * 0.5) : (g_impulseStart + _atr * 0.5);
-      else if(g_resolvedMarketMode == MARKET_MODE_GOLD)
-         _sl = (g_impulseDir == DIR_LONG) ? (g_impulseStart - _atr * 0.8) : (g_impulseStart + _atr * 0.8);
-      else
-         _sl = (g_impulseDir == DIR_LONG) ? (g_impulseStart - _atr * 1.0) : (g_impulseStart + _atr * 1.0);
+      _sl = (g_impulseDir == DIR_LONG)
+            ? (g_impulseStart - _atr * g_profile.slATRMult)
+            : (g_impulseStart + _atr * g_profile.slATRMult);
 
       double _risk   = MathAbs(_entry - _sl);
       double _reward = MathAbs(_tp - _entry);
       g_stats.RR_Actual = (_risk > _point * 0.5) ? (_reward / _risk) : 0.0;
-      g_stats.RR_Min    = MinRR_EntryGate;
+      g_stats.RR_Min    = g_profile.minRR_EntryGate;
 
       double _cost = (_spread * g_profile.spreadMult) + (g_effectiveBandWidthPts * 2.0) + (g_stats.LeaveDistancePts * 2.0);
       double _rangeP = g_stats.RangePts;
       g_stats.RangeCostMult_Actual = (_cost > 0.0) ? (_rangeP / _cost) : 0.0;
-      g_stats.RangeCostMult_Min    = MinRangeCostMult;
+      g_stats.RangeCostMult_Min    = g_profile.minRangeCostMult;
    }
 
    // === RiskGate判定（DOC-CORE 3.2 / 9.4.1） ===
@@ -3587,6 +3557,61 @@ void Process_TOUCH_2_WAIT_CONFIRM()
          ChangeState(STATE_IDLE, "RiskGateSoftBlock");
          ResetAllState();
          return;
+      }
+
+      // === EntryGate: RR / RangeCost チェック（DOC-CORE 9.5） ===
+      {
+         double _egAtr = GetATR_M1(0);
+         double _egEntry = (g_impulseDir == DIR_LONG)
+                           ? SymbolInfoDouble(Symbol(), SYMBOL_ASK)
+                           : SymbolInfoDouble(Symbol(), SYMBOL_BID);
+         double _egTP = g_impulseEnd;
+         double _egSL = (g_impulseDir == DIR_LONG)
+                        ? (g_impulseStart - _egAtr * g_profile.slATRMult)
+                        : (g_impulseStart + _egAtr * g_profile.slATRMult);
+
+         double _egRisk   = MathAbs(_egEntry - _egSL);
+         double _egReward = MathAbs(_egTP - _egEntry);
+         double _egPoint  = SymbolInfoDouble(Symbol(), SYMBOL_POINT);
+         double _egRR     = (_egRisk > _egPoint * 0.5) ? (_egReward / _egRisk) : 0.0;
+
+         // (a) MinRR check
+         if(_egRR < g_profile.minRR_EntryGate)
+         {
+            g_stats.RR_Actual   = _egRR;
+            g_stats.RejectStage = "RR_FAIL";
+            g_stats.FinalState  = "EntryGate_RR_Fail";
+            WriteLog(LOG_REJECT, "", "RR_FAIL",
+                     "RR=" + DoubleToString(_egRR, 3) +
+                     ";MinRR=" + DoubleToString(g_profile.minRR_EntryGate, 3) +
+                     ";Risk=" + DoubleToString(_egRisk, (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS)) +
+                     ";Reward=" + DoubleToString(_egReward, (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS)));
+            ChangeState(STATE_IDLE, "EntryGate_RR_Fail");
+            ResetAllState();
+            return;
+         }
+
+         // (b) MinRangeCostMult check
+         double _egSpread = SymbolInfoDouble(Symbol(), SYMBOL_ASK) - SymbolInfoDouble(Symbol(), SYMBOL_BID);
+         double _egRangeCost = (_egSpread > 0.0) ? (_egReward / _egSpread) : 999.0;
+         if(_egRangeCost < g_profile.minRangeCostMult)
+         {
+            g_stats.RangeCostMult_Actual = _egRangeCost;
+            g_stats.RejectStage = "RANGE_COST_FAIL";
+            g_stats.FinalState  = "EntryGate_RangeCost_Fail";
+            WriteLog(LOG_REJECT, "", "RANGE_COST_FAIL",
+                     "RangeCost=" + DoubleToString(_egRangeCost, 2) +
+                     ";MinRangeCost=" + DoubleToString(g_profile.minRangeCostMult, 2) +
+                     ";Reward=" + DoubleToString(_egReward, (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS)) +
+                     ";Spread=" + DoubleToString(_egSpread, (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS)));
+            ChangeState(STATE_IDLE, "EntryGate_RangeCost_Fail");
+            ResetAllState();
+            return;
+         }
+
+         // EntryGate Pass → RR/RangeCostを記録
+         g_stats.RR_Actual            = _egRR;
+         g_stats.RangeCostMult_Actual = _egRangeCost;
       }
 
       // Entry実行
