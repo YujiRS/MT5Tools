@@ -1,6 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //| ScalpImpulseRetraceEA.mq5                                        |
-//| ScalpImpulseRetraceEA v1.4                                       |
+//| ScalpImpulseRetraceEA v1.5                                       |
+//| GOLD Confirm OR + TPExt(CHANGE-007)                              |
 //| TP Extension(CHANGE-006) + EntryGate市場別化(CHANGE-005)          |
 //+------------------------------------------------------------------+
 #property copyright "ScalpImpulseRetraceEA"
@@ -12,7 +13,7 @@
 //| 定数定義                                                          |
 //+------------------------------------------------------------------+
 #define EA_NAME           "ScaEA"
-#define EA_VERSION        "v1.4"
+#define EA_VERSION        "v1.5"
 
 //+------------------------------------------------------------------+
 //| Enum定義（第1章・第3章・第12章）                                    |
@@ -160,7 +161,7 @@ input double            SLATRMult_GOLD          = 0.8;           // SLATRMult_GO
 input double            SLATRMult_CRYPTO        = 0.7;           // SLATRMult_CRYPTO
 // --- TP Extension: TP = ImpulseEnd ± Range × this（市場別） ---
 input double            TPExtRatio_FX           = 0.0;           // TPExtRatio_FX(0=Fib100そのまま)
-input double            TPExtRatio_GOLD         = 0.0;           // TPExtRatio_GOLD
+input double            TPExtRatio_GOLD         = 0.382;         // TPExtRatio_GOLD(CHANGE-007)
 input double            TPExtRatio_CRYPTO       = 0.382;         // TPExtRatio_CRYPTO(CHANGE-006)
 
 // 【G3：戦略（基本触らない）】
@@ -2355,14 +2356,16 @@ ENUM_CONFIRM_TYPE EvaluateConfirm()
       }
       case MARKET_MODE_GOLD:
       {
-         // GOLD: WickRejection AND MicroBreak
+         // GOLD: WickRejection OR MicroBreak (CHANGE-007: AND→OR)
+         // WickRejection を引き続きトラッキング（ログ用）
          if(CheckWickRejection())
          {
             g_wickRejectionSeen = true;
+            return CONFIRM_WICK_REJECTION;   // WickRejectのみで許可
          }
-         if(g_wickRejectionSeen && CheckMicroBreak())
+         if(CheckMicroBreak())
          {
-            return CONFIRM_MICRO_BREAK; // 両方成立
+            return CONFIRM_MICRO_BREAK;      // MicroBreakのみで許可
          }
          break;
       }
