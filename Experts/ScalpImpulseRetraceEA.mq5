@@ -1,7 +1,7 @@
 ﻿//+------------------------------------------------------------------+
 //| ScalpImpulseRetraceEA.mq5                                        |
-//| ScalpImpulseRetraceEA v1.3                                       |
-//| EntryGate市場別化・SLATRMult Input化(CHANGE-005)                   |
+//| ScalpImpulseRetraceEA v1.4                                       |
+//| TP Extension(CHANGE-006) + EntryGate市場別化(CHANGE-005)          |
 //+------------------------------------------------------------------+
 #property copyright "ScalpImpulseRetraceEA"
 #property link      ""
@@ -12,7 +12,7 @@
 //| 定数定義                                                          |
 //+------------------------------------------------------------------+
 #define EA_NAME           "ScaEA"
-#define EA_VERSION        "v1.3"
+#define EA_VERSION        "v1.4"
 
 //+------------------------------------------------------------------+
 //| Enum定義（第1章・第3章・第12章）                                    |
@@ -158,6 +158,10 @@ input double            MinRangeCostMult_CRYPTO = 2.0;           // MinRangeCost
 input double            SLATRMult_FX            = 0.7;           // SLATRMult_FX(SL=ImpulseStart±ATR*this)
 input double            SLATRMult_GOLD          = 0.8;           // SLATRMult_GOLD
 input double            SLATRMult_CRYPTO        = 0.7;           // SLATRMult_CRYPTO
+// --- TP Extension: TP = ImpulseEnd ± Range × this（市場別） ---
+input double            TPExtRatio_FX           = 0.0;           // TPExtRatio_FX(0=Fib100そのまま)
+input double            TPExtRatio_GOLD         = 0.0;           // TPExtRatio_GOLD
+input double            TPExtRatio_CRYPTO       = 0.382;         // TPExtRatio_CRYPTO(CHANGE-006)
 
 // 【G3：戦略（基本触らない）】
 input bool              OptionalBand38         = false;          // OptionalBand38
@@ -229,6 +233,7 @@ struct MarketProfileData
    double            slATRMult;               // SL = ImpulseStart ± ATR × this
    double            minRR_EntryGate;         // 最低リスクリワード
    double            minRangeCostMult;        // 最低コスト倍率
+   double            tpExtensionRatio;        // TP = ImpulseEnd ± Range × this (CHANGE-006)
 };
 
 // === ANALYZE追加 === ImpulseSummary構造体
@@ -583,6 +588,7 @@ void InitMarketProfile()
          g_profile.slATRMult               = SLATRMult_FX;
          g_profile.minRR_EntryGate         = MinRR_EntryGate_FX;
          g_profile.minRangeCostMult        = MinRangeCostMult_FX;
+         g_profile.tpExtensionRatio        = TPExtRatio_FX;
          break;
 
       case MARKET_MODE_GOLD:
@@ -609,6 +615,7 @@ void InitMarketProfile()
          g_profile.slATRMult               = SLATRMult_GOLD;
          g_profile.minRR_EntryGate         = MinRR_EntryGate_GOLD;
          g_profile.minRangeCostMult        = MinRangeCostMult_GOLD;
+         g_profile.tpExtensionRatio        = TPExtRatio_GOLD;
          break;
 
       case MARKET_MODE_CRYPTO:
@@ -635,6 +642,7 @@ void InitMarketProfile()
          g_profile.slATRMult               = SLATRMult_CRYPTO;
          g_profile.minRR_EntryGate         = MinRR_EntryGate_CRYPTO;
          g_profile.minRangeCostMult        = MinRangeCostMult_CRYPTO;
+         g_profile.tpExtensionRatio        = TPExtRatio_CRYPTO;
          break;
 
       default:
@@ -2497,6 +2505,21 @@ bool ExecuteEntry()
 }
 
 //+------------------------------------------------------------------+
+//| TP算出（CHANGE-006: TP Extension対応）                              |
+//| TP = ImpulseEnd ± ImpulseRange × tpExtensionRatio                |
+//| tpExtensionRatio=0 のとき従来どおり ImpulseEnd そのまま              |
+//+------------------------------------------------------------------+
+double GetExtendedTP()
+{
+   double impulseRange = MathAbs(g_impulseEnd - g_impulseStart);
+   double ext = g_profile.tpExtensionRatio;
+   if(g_impulseDir == DIR_LONG)
+      return g_impulseEnd + impulseRange * ext;
+   else
+      return g_impulseEnd - impulseRange * ext;
+}
+
+//+------------------------------------------------------------------+
 //| SL/TP計算（第9章）                                                 |
 //+------------------------------------------------------------------+
 void CalculateSLTP(double entryPrice)
@@ -2509,12 +2532,12 @@ void CalculateSLTP(double entryPrice)
    if(g_impulseDir == DIR_LONG)
    {
       g_sl = g_impulseStart - atr * mult;
-      g_tp = g_impulseEnd;
+      g_tp = GetExtendedTP();   // CHANGE-006
    }
    else
    {
       g_sl = g_impulseStart + atr * mult;
-      g_tp = g_impulseEnd;
+      g_tp = GetExtendedTP();   // CHANGE-006
    }
 }
 
@@ -2523,7 +2546,7 @@ void PreviewSLTP(double entryPrice, double &outSL, double &outTP)
 {
    double atr = GetATR_M1(0);
    double mult = g_profile.slATRMult;
-   outTP = g_impulseEnd;
+   outTP = GetExtendedTP();   // CHANGE-006
    outSL = (g_impulseDir == DIR_LONG) ? (g_impulseStart - atr * mult) : (g_impulseStart + atr * mult);
 }
 
@@ -3129,7 +3152,7 @@ void Process_IMPULSE_CONFIRMED()
       double _atr = GetATR_M1(0);
       double _entry = g_fib500;
       double _sl = 0.0;
-      double _tp = g_impulseEnd;
+      double _tp = GetExtendedTP();   // CHANGE-006
       double _point = SymbolInfoDouble(Symbol(), SYMBOL_POINT);
       double _spread = SymbolInfoDouble(Symbol(), SYMBOL_ASK) - SymbolInfoDouble(Symbol(), SYMBOL_BID);
 
@@ -3565,7 +3588,7 @@ void Process_TOUCH_2_WAIT_CONFIRM()
          double _egEntry = (g_impulseDir == DIR_LONG)
                            ? SymbolInfoDouble(Symbol(), SYMBOL_ASK)
                            : SymbolInfoDouble(Symbol(), SYMBOL_BID);
-         double _egTP = g_impulseEnd;
+         double _egTP = GetExtendedTP();   // CHANGE-006
          double _egSL = (g_impulseDir == DIR_LONG)
                         ? (g_impulseStart - _egAtr * g_profile.slATRMult)
                         : (g_impulseStart + _egAtr * g_profile.slATRMult);
@@ -4019,7 +4042,9 @@ int OnInit()
             " SmallBodyRatio=", g_profile.smallBodyRatio,
             " FreezeCancelWindow=", g_profile.freezeCancelWindowBars,
             " ConfirmTimeLimit=", g_profile.confirmTimeLimitBars,
-            " SpreadMult=", g_profile.spreadMult);
+            " SpreadMult=", g_profile.spreadMult,
+            " SLATRMult=", g_profile.slATRMult,
+            " TPExtRatio=", g_profile.tpExtensionRatio);
    }
 
    // ATRハンドル作成
