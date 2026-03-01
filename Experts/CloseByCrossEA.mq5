@@ -3,7 +3,7 @@
 //| Closes a specific position on SMA13/SMA21 cross                   |
 //+------------------------------------------------------------------+
 #property copyright "CloseByCrossEA"
-#property version   "1.02"
+#property version   "1.05"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -17,15 +17,22 @@ input bool            ShowPanel         = true;
 input int             PanelX            = 10;
 input int             PanelY            = 20;
 
-//--- SMA Display
-input bool            ShowSMA           = false;  // Show 13SMA/21SMA on chart
-
 //--- Internal
-enum EA_STATE { ST_INIT, ST_WAIT_SYNC, ST_ARMED, ST_CLOSED, ST_ERROR };
+enum EA_STATE {
+   ST_INIT,
+   ST_WAIT_SYNC,
+   ST_ARMED,
+   ST_CONFIRM_WAIT,    // Cross detected, waiting 1 bar to confirm
+   ST_PENDING_CLOSE,   // Close failed, retrying
+   ST_CLOSED,
+   ST_ERROR
+};
 
 EA_STATE  g_state       = ST_INIT;
 string    g_error       = "";
 string    g_posDir      = "";
+string    g_crossType   = "";          // "GoldenCross" or "DeadCross"
+bool      g_crossIsGolden = false;     // true=Golden, false=Dead
 int       g_hSMA13      = INVALID_HANDLE;
 int       g_hSMA21      = INVALID_HANDLE;
 datetime  g_lastBar     = 0;
@@ -33,20 +40,28 @@ bool      g_synced      = false;
 string    g_objPrefix   = "";
 CTrade    g_trade;
 
+int       g_closeRetry  = 0;
+int       g_goneCount   = 0;
+datetime  g_lastRetryTime = 0;
+
 const int FONT_SIZE     = 9;
 const int LINE_HEIGHT   = 20;
-const int MAX_LINES     = 5;
+const int MAX_LINES     = 6;
+const int CLOSE_MAX_RETRY  = 10;
+const int GONE_THRESHOLD   = 5;
 
 //+------------------------------------------------------------------+
 string StateToString(EA_STATE s)
 {
    switch(s)
    {
-      case ST_INIT:      return "INIT";
-      case ST_WAIT_SYNC: return "WAIT_SYNC";
-      case ST_ARMED:     return "ARMED";
-      case ST_CLOSED:    return "CLOSED";
-      case ST_ERROR:     return "ERROR";
+      case ST_INIT:          return "INIT";
+      case ST_WAIT_SYNC:     return "WAIT_SYNC";
+      case ST_ARMED:         return "ARMED";
+      case ST_CONFIRM_WAIT:  return "CONFIRM_WAIT";
+      case ST_PENDING_CLOSE: return "PENDING_CLOSE";
+      case ST_CLOSED:        return "CLOSED";
+      case ST_ERROR:         return "ERROR";
    }
    return "UNKNOWN";
 }
@@ -86,12 +101,86 @@ bool GetSMA(double &sma13_prev, double &sma13_curr, double &sma21_prev, double &
 }
 
 //+------------------------------------------------------------------+
+// Get SMA at shift=1 only (for confirmation check)
+bool GetSMACurrent(double &sma13, double &sma21)
+{
+   double buf13[1], buf21[1];
+   if(CopyBuffer(g_hSMA13, 0, 1, 1, buf13) < 1) return false;
+   if(CopyBuffer(g_hSMA21, 0, 1, 1, buf21) < 1) return false;
+   sma13 = buf13[0];
+   sma21 = buf21[0];
+   return true;
+}
+
+//+------------------------------------------------------------------+
 bool PositionExists()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(PositionGetTicket(i) == TargetTicket) return true;
    }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool CheckPositionAlive()
+{
+   if(PositionExists())
+   {
+      if(g_goneCount > 0)
+      {
+         Print("[CloseByCrossEA] Position found again after ", g_goneCount, " miss(es)");
+         g_goneCount = 0;
+      }
+      return true;
+   }
+
+   g_goneCount++;
+   if(g_goneCount >= GONE_THRESHOLD)
+   {
+      SetState(ST_CLOSED, "Position gone (" + (string)GONE_THRESHOLD + " consecutive checks)");
+      return false;
+   }
+
+   Print("[CloseByCrossEA] Position not found (", g_goneCount, "/", GONE_THRESHOLD, ")");
+   return true;
+}
+
+//+------------------------------------------------------------------+
+bool TryClose()
+{
+   if(!PositionExists())
+   {
+      g_goneCount++;
+      if(g_goneCount >= GONE_THRESHOLD)
+      {
+         SetState(ST_CLOSED, "Position gone during close retry");
+         return true;
+      }
+      Print("[CloseByCrossEA] Position not found before close attempt (", g_goneCount, "/", GONE_THRESHOLD, ")");
+      return false;
+   }
+   g_goneCount = 0;
+
+   g_closeRetry++;
+   Print("[CloseByCrossEA] Closing ticket ", TargetTicket, " attempt ", g_closeRetry, "/", CLOSE_MAX_RETRY);
+
+   if(g_trade.PositionClose(TargetTicket))
+   {
+      SetState(ST_CLOSED, "Closed by " + g_crossType + " (attempt " + (string)g_closeRetry + ")");
+      return true;
+   }
+
+   Print("[CloseByCrossEA] Close FAILED: ", g_trade.ResultRetcode(),
+         " ", g_trade.ResultRetcodeDescription());
+   UpdatePanel();
+
+   if(g_closeRetry >= CLOSE_MAX_RETRY)
+   {
+      SetState(ST_ERROR, "Close failed " + (string)CLOSE_MAX_RETRY + " times");
+      return true;
+   }
+
    return false;
 }
 
@@ -136,15 +225,11 @@ int OnInit()
       return INIT_SUCCEEDED;
    }
 
-   // Show SMA lines on chart
-   if(ShowSMA)
-   {
-      AddSMAToChart(g_hSMA13);
-      AddSMAToChart(g_hSMA21);
-   }
-
-   g_lastBar = iTime(_Symbol, SignalTF, 0);
-   g_synced  = false;
+   g_lastBar       = iTime(_Symbol, SignalTF, 0);
+   g_synced        = false;
+   g_closeRetry    = 0;
+   g_goneCount     = 0;
+   g_lastRetryTime = 0;
 
    SetState(ST_WAIT_SYNC);
    return INIT_SUCCEEDED;
@@ -153,16 +238,8 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(g_hSMA13 != INVALID_HANDLE)
-   {
-      RemoveSMAFromChart(g_hSMA13);
-      IndicatorRelease(g_hSMA13);
-   }
-   if(g_hSMA21 != INVALID_HANDLE)
-   {
-      RemoveSMAFromChart(g_hSMA21);
-      IndicatorRelease(g_hSMA21);
-   }
+   if(g_hSMA13 != INVALID_HANDLE) IndicatorRelease(g_hSMA13);
+   if(g_hSMA21 != INVALID_HANDLE) IndicatorRelease(g_hSMA21);
    DeletePanel();
 }
 
@@ -172,14 +249,70 @@ void OnTick()
    if(g_state == ST_CLOSED || g_state == ST_ERROR) return;
    if(g_state == ST_INIT) return;
 
-   if(!PositionExists())
+   //--- PENDING_CLOSE: retry with 1-second throttle
+   if(g_state == ST_PENDING_CLOSE)
    {
-      SetState(ST_CLOSED, "Position gone (closed externally)");
+      datetime now = TimeCurrent();
+      if(now <= g_lastRetryTime) return;
+      g_lastRetryTime = now;
+      TryClose();
       return;
    }
 
+   //--- Position alive check
+   if(!CheckPositionAlive()) return;
+
    if(!IsNewBar()) return;
 
+   //--- CONFIRM_WAIT: check if cross still holds on the next confirmed bar
+   if(g_state == ST_CONFIRM_WAIT)
+   {
+      double s13, s21;
+      if(!GetSMACurrent(s13, s21))
+      {
+         Print("[CloseByCrossEA] CopyBuffer failed in CONFIRM_WAIT, retry next bar");
+         return;
+      }
+
+      // DeadCross confirm: SMA13 still below SMA21
+      // GoldenCross confirm: SMA13 still above SMA21
+      bool confirmed = false;
+      if(!g_crossIsGolden && (s13 < s21))   confirmed = true;  // Dead still holds
+      if( g_crossIsGolden && (s13 > s21))   confirmed = true;  // Golden still holds
+
+      if(!confirmed)
+      {
+         Print("[CloseByCrossEA] Cross NOT confirmed (SMA13=", s13, " SMA21=", s21,
+               ") -> false cross, back to ARMED");
+         SetState(ST_ARMED, "False cross rejected");
+         return;
+      }
+
+      Print("[CloseByCrossEA] Cross CONFIRMED (SMA13=", s13, " SMA21=", s21, ") -> closing");
+
+      // Direction match (re-check for safety)
+      bool shouldClose = false;
+      if( g_crossIsGolden && g_posDir == "SELL") shouldClose = true;
+      if(!g_crossIsGolden && g_posDir == "BUY")  shouldClose = true;
+
+      if(!shouldClose)
+      {
+         Print("[CloseByCrossEA] Confirmed cross direction vs position (", g_posDir, ") mismatch. Back to ARMED.");
+         SetState(ST_ARMED);
+         return;
+      }
+
+      // Attempt close
+      g_closeRetry = 0;
+      g_goneCount  = 0;
+      if(!TryClose())
+      {
+         SetState(ST_PENDING_CLOSE, g_crossType + " confirmed, retrying close...");
+      }
+      return;
+   }
+
+   //--- ARMED: normal cross detection
    double s13p, s13c, s21p, s21c;
    if(!GetSMA(s13p, s13c, s21p, s21c))
    {
@@ -187,7 +320,7 @@ void OnTick()
       return;
    }
 
-   // Initial sync: record relationship, don't act
+   // Initial sync
    if(!g_synced)
    {
       g_synced = true;
@@ -197,69 +330,32 @@ void OnTick()
       return;
    }
 
-   // Cross detection on confirmed bars
+   // Cross detection
    bool goldenCross = (s13p <= s21p) && (s13c > s21c);
    bool deadCross   = (s13p >= s21p) && (s13c < s21c);
 
    if(!goldenCross && !deadCross) return;
 
-   Print("[CloseByCrossEA] Cross: ", (goldenCross ? "GOLDEN" : "DEAD"),
+   g_crossIsGolden = goldenCross;
+   g_crossType     = goldenCross ? "GoldenCross" : "DeadCross";
+
+   Print("[CloseByCrossEA] Cross detected: ", g_crossType,
          " | SMA13[2]=", s13p, " SMA21[2]=", s21p,
-         " | SMA13[1]=", s13c, " SMA21[1]=", s21c);
+         " | SMA13[1]=", s13c, " SMA21[1]=", s21c,
+         " -> waiting 1 bar to confirm");
 
-   // Direction match check
-   bool shouldClose = false;
-   if(goldenCross && g_posDir == "SELL") shouldClose = true;
-   if(deadCross   && g_posDir == "BUY")  shouldClose = true;
+   // Direction pre-check (skip confirmation wait if direction won't match anyway)
+   bool wouldClose = false;
+   if( goldenCross && g_posDir == "SELL") wouldClose = true;
+   if( deadCross   && g_posDir == "BUY")  wouldClose = true;
 
-   if(!shouldClose)
+   if(!wouldClose)
    {
-      Print("[CloseByCrossEA] Cross direction vs position (", g_posDir, ") mismatch. Waiting.");
+      Print("[CloseByCrossEA] Cross direction vs position (", g_posDir, ") mismatch. Ignoring.");
       return;
    }
 
-   if(!PositionExists())
-   {
-      SetState(ST_CLOSED, "Position gone before close attempt");
-      return;
-   }
-
-   Print("[CloseByCrossEA] Closing ticket ", TargetTicket, " (", g_posDir, ")");
-   if(g_trade.PositionClose(TargetTicket))
-   {
-      SetState(ST_CLOSED, "Closed by " + (goldenCross ? "GoldenCross" : "DeadCross"));
-   }
-   else
-   {
-      Print("[CloseByCrossEA] Close FAILED: ", g_trade.ResultRetcode(),
-            " ", g_trade.ResultRetcodeDescription());
-   }
-}
-
-//+------------------------------------------------------------------+
-//| SMA Chart Display                                                  |
-//+------------------------------------------------------------------+
-void AddSMAToChart(int handle)
-{
-   // Add indicator to main chart window (colors adjustable via MT5 indicator list)
-   if(!ChartIndicatorAdd(0, 0, handle))
-      Print("[CloseByCrossEA] ChartIndicatorAdd failed for handle=", handle);
-}
-
-//+------------------------------------------------------------------+
-void RemoveSMAFromChart(int handle)
-{
-   int total = ChartIndicatorsTotal(0, 0);
-   for(int i = total - 1; i >= 0; i--)
-   {
-      string name = ChartIndicatorName(0, 0, i);
-      int h = ChartIndicatorGet(0, 0, name);
-      if(h == handle)
-      {
-         ChartIndicatorDelete(0, 0, name);
-         break;
-      }
-   }
+   SetState(ST_CONFIRM_WAIT, g_crossType + " detected, confirming...");
 }
 
 //+------------------------------------------------------------------+
@@ -276,6 +372,8 @@ void UpdatePanel()
    lines[count++] = "CloseByCrossEA  TF=" + EnumToString(SignalTF);
    lines[count++] = "Ticket: " + (string)TargetTicket + "  " + g_posDir;
    lines[count++] = "State:  " + StateToString(g_state);
+   if(g_state == ST_PENDING_CLOSE)
+      lines[count++] = "Retry: " + (string)g_closeRetry + "/" + (string)CLOSE_MAX_RETRY;
    if(g_error != "")
       lines[count++] = g_error;
 
@@ -298,10 +396,12 @@ void UpdatePanel()
       ObjectSetString(0, name, OBJPROP_TEXT, lines[i]);
 
       color clr = clrWhite;
-      if(g_state == ST_ERROR)     clr = clrRed;
-      if(g_state == ST_CLOSED)    clr = clrLime;
-      if(g_state == ST_ARMED)     clr = clrDodgerBlue;
-      if(g_state == ST_WAIT_SYNC) clr = clrYellow;
+      if(g_state == ST_ERROR)         clr = clrRed;
+      if(g_state == ST_CLOSED)        clr = clrLime;
+      if(g_state == ST_ARMED)         clr = clrDodgerBlue;
+      if(g_state == ST_WAIT_SYNC)     clr = clrYellow;
+      if(g_state == ST_CONFIRM_WAIT)  clr = clrGold;
+      if(g_state == ST_PENDING_CLOSE) clr = clrOrange;
       ObjectSetInteger(0, name, OBJPROP_COLOR, clr);
    }
 
