@@ -12,13 +12,13 @@
 input ENUM_TIMEFRAMES SignalTF          = PERIOD_CURRENT;
 input ulong           TargetTicket      = 0;
 
-//--- SMA Display
-input bool            ShowSMA           = true;  // Show 13SMA/21SMA on chart
-
 //--- Panel
 input bool            ShowPanel         = true;
 input int             PanelX            = 10;
 input int             PanelY            = 20;
+
+//--- SMA Display
+input bool            ShowSMA           = false;  // Show 13SMA/21SMA on chart
 
 //--- Internal
 enum EA_STATE { ST_INIT, ST_WAIT_SYNC, ST_ARMED, ST_CLOSED, ST_ERROR };
