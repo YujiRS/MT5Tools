@@ -1,19 +1,20 @@
 ﻿//+------------------------------------------------------------------+
 //| ScalpImpulseRetraceEA.mq5                                        |
-//| ScalpImpulseRetraceEA v1.5                                       |
+//| ScalpImpulseRetraceEA v1.6                                       |
+//| EMA Cross Exit + RR Gate廃止 (CHANGE-008)                         |
 //| GOLD Confirm OR + TPExt(CHANGE-007)                              |
 //| TP Extension(CHANGE-006) + EntryGate市場別化(CHANGE-005)          |
 //+------------------------------------------------------------------+
 #property copyright "ScalpImpulseRetraceEA"
 #property link      ""
-#property version   "1.30"
+#property version   "1.60"
 #property strict
 
 //+------------------------------------------------------------------+
 //| 定数定義                                                          |
 //+------------------------------------------------------------------+
 #define EA_NAME           "ScaEA"
-#define EA_VERSION        "v1.5"
+#define EA_VERSION        "v1.6"
 
 //+------------------------------------------------------------------+
 //| Enum定義（第1章・第3章・第12章）                                    |
@@ -124,6 +125,11 @@ input bool              EnableMailNotification   = false;         // メール�
 input bool              EnableSoundNotification  = false;         // サウンド通知（初期OFF）
 input string            SoundFileName            = "alert.wav";   // terminal/Sounds 内
 
+// --- Exit: EMAクロス決済 ---
+input int               ExitMAFastPeriod       = 13;             // Exit EMA Fast Period
+input int               ExitMASlowPeriod       = 21;             // Exit EMA Slow Period
+input int               ExitConfirmBars        = 1;              // Exit Confirm Bars (1本確認)
+
 // === TrendFilter / ReversalGuard (順張り方向フィルタ) ===
 input bool   TrendFilter_Enable          = true;
 input double TrendSlopeMult_FX           = 0.05;   // FX ATR(M15)*mult
@@ -160,7 +166,7 @@ input double            SLATRMult_FX            = 0.7;           // SLATRMult_FX
 input double            SLATRMult_GOLD          = 0.8;           // SLATRMult_GOLD
 input double            SLATRMult_CRYPTO        = 0.7;           // SLATRMult_CRYPTO
 // --- TP Extension: TP = ImpulseEnd ± Range × this（市場別） ---
-input double            TPExtRatio_FX           = 0.0;           // TPExtRatio_FX(0=Fib100そのまま)
+input double            TPExtRatio_FX           = 0.382;         // TPExtRatio_FX(0=Fib100そのまま)
 input double            TPExtRatio_GOLD         = 0.382;         // TPExtRatio_GOLD(CHANGE-007)
 input double            TPExtRatio_CRYPTO       = 0.382;         // TPExtRatio_CRYPTO(CHANGE-006)
 
@@ -518,6 +524,12 @@ datetime          g_leaveStartTime_Opt38   = 0;
 
 // ADAPTIVE Spread計算用
 int               g_spreadSampleMinutes = 15; // 内部定数
+
+// === CHANGE-008 === Exit EMAクロス用ハンドル・状態
+int               g_exitEMAFastHandle  = INVALID_HANDLE;
+int               g_exitEMASlowHandle  = INVALID_HANDLE;
+bool              g_exitPending        = false;   // EMAクロス検出後の確認待ち
+int               g_exitPendingBars    = 0;       // ExitPending経過バー数
 
 // ATRハンドル
 int               g_atrHandleM1        = INVALID_HANDLE;
@@ -2523,7 +2535,7 @@ double GetExtendedTP()
 }
 
 //+------------------------------------------------------------------+
-//| SL/TP計算（第9章）                                                 |
+//| SL/TP計算（第9章）CHANGE-008: TP=0（EMAクロス決済のためサーバーTP不使用）|
 //+------------------------------------------------------------------+
 void CalculateSLTP(double entryPrice)
 {
@@ -2535,13 +2547,14 @@ void CalculateSLTP(double entryPrice)
    if(g_impulseDir == DIR_LONG)
    {
       g_sl = g_impulseStart - atr * mult;
-      g_tp = GetExtendedTP();   // CHANGE-006
    }
    else
    {
       g_sl = g_impulseStart + atr * mult;
-      g_tp = GetExtendedTP();   // CHANGE-006
    }
+
+   // CHANGE-008: サーバーTP=0（EMAクロスで決済するため指値TPを使用しない）
+   g_tp = 0;
 }
 
 // === CHANGE-002 === EntryGate用: SL/TPのプレビュー算出（グローバル非書き換え）
@@ -2556,7 +2569,7 @@ void PreviewSLTP(double entryPrice, double &outSL, double &outTP)
 //+------------------------------------------------------------------+
 //| ポジション管理（第9章）                                             |
 //+------------------------------------------------------------------+
-void ClosePosition(string reason)
+void ClosePosition(string reason, string extraInfo = "")
 {
    if(!PositionSelectByTicket(g_ticket))
       return;
@@ -2582,88 +2595,191 @@ void ClosePosition(string reason)
 
    if(OrderSend(request, result))
    {
-      WriteLog(LOG_EXIT, reason, "", "closePrice=" + DoubleToString(result.price,
-               (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS)));
+      string logExtra = "closePrice=" + DoubleToString(result.price,
+               (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS));
+      if(extraInfo != "")
+         logExtra += ";" + extraInfo;
+      WriteLog(LOG_EXIT, reason, "", logExtra);
    }
 }
 
-// ポジション管理：建値・時間撤退（第9.3章）
+// === CHANGE-008 === Exit EMA値取得ヘルパー
+double GetExitEMA(int handle, int shift)
+{
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   if(CopyBuffer(handle, 0, shift, 1, buf) <= 0)
+      return 0.0;
+   return buf[0];
+}
+
+// ポジション管理：CHANGE-008 EMAクロス決済（確定足＋1本確認）
 void ManagePosition()
 {
    if(!PositionSelectByTicket(g_ticket))
    {
       // ポジションなし → 決済済み
-      g_stats.FinalState = "PositionClosed";  // === ANALYZE追加 ===
+      g_stats.FinalState = "PositionClosed";
       ChangeState(STATE_COOLDOWN, "PositionClosed");
       return;
    }
 
-   double currentPrice;
-   double posProfit = PositionGetDouble(POSITION_PROFIT);
    double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
    double currentSL = PositionGetDouble(POSITION_SL);
+   int digits = (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS);
 
-   if(g_impulseDir == DIR_LONG)
-      currentPrice = SymbolInfoDouble(Symbol(), SYMBOL_BID);
-   else
-      currentPrice = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
-
-   // 建値移動: RR >= 1.0で建値
-   double risk = MathAbs(openPrice - g_sl);
-   double reward = 0;
-   if(g_impulseDir == DIR_LONG)
-      reward = currentPrice - openPrice;
-   else
-      reward = openPrice - currentPrice;
-
-   if(risk > 0 && (reward / risk) >= 1.0)
+   // =====================================================================
+   // Exit優先順位1: 構造破綻（Fib0 = ImpulseStart 終値割れ/超え：確定足）
+   // =====================================================================
    {
-      // 建値にSLを移動
-      if(g_impulseDir == DIR_LONG && currentSL < openPrice)
+      double close1 = iClose(Symbol(), PERIOD_M1, 1);  // 直近確定足
+      bool structBreak = false;
+
+      if(g_impulseDir == DIR_LONG && close1 < g_impulseStart)
+         structBreak = true;
+      else if(g_impulseDir == DIR_SHORT && close1 > g_impulseStart)
+         structBreak = true;
+
+      if(structBreak)
       {
-         ModifySL(openPrice);
-      }
-      else if(g_impulseDir == DIR_SHORT && currentSL > openPrice)
-      {
-         ModifySL(openPrice);
+         g_stats.FinalState = "StructBreak_Fib0";
+         ClosePosition("StructBreak_Fib0",
+                  "ExitReason=STRUCT_BREAK;Fib0=" + DoubleToString(g_impulseStart, digits) +
+                  ";Close1=" + DoubleToString(close1, digits));
+         ChangeState(STATE_COOLDOWN, "StructBreak_Fib0");
+         return;
       }
    }
 
-   // 時間撤退: Entry後N本以内に伸びない
+   // =====================================================================
+   // Exit優先順位2: 時間撤退（Entry後N本以内に伸びない）
+   // =====================================================================
    g_positionBars++;
    if(g_positionBars >= g_profile.timeExitBars)
    {
-      // 利益が出ていなければ撤退
+      double posProfit = PositionGetDouble(POSITION_PROFIT);
       if(posProfit <= 0)
       {
-         ClosePosition("TimeExit");
-         g_stats.FinalState = "TimeExit";  // === ANALYZE追加 ===
+         g_stats.FinalState = "TimeExit";
+         ClosePosition("TimeExit",
+                  "ExitReason=TIMEOUT;Bars=" + IntegerToString(g_positionBars));
          ChangeState(STATE_COOLDOWN, "TimeExit");
          return;
       }
    }
 
-   // 再度押し帯に深く戻る → 構造破綻として撤退
-   double bandUpper, bandLower;
-   GetActiveBand(bandUpper, bandLower);
-   if(g_impulseDir == DIR_LONG)
+   // =====================================================================
+   // 建値移動: RR >= 1.0で建値（維持）
+   // =====================================================================
    {
-      if(currentPrice < bandLower)
+      double risk = MathAbs(openPrice - g_sl);
+      double reward = 0;
+      double currentPrice;
+      if(g_impulseDir == DIR_LONG)
       {
-         ClosePosition("DeepRetrace");
-         g_stats.FinalState = "DeepRetrace";  // === ANALYZE追加 ===
-         ChangeState(STATE_COOLDOWN, "DeepRetrace");
-         return;
+         currentPrice = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+         reward = currentPrice - openPrice;
+      }
+      else
+      {
+         currentPrice = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+         reward = openPrice - currentPrice;
+      }
+
+      if(risk > 0 && (reward / risk) >= 1.0)
+      {
+         if(g_impulseDir == DIR_LONG && currentSL < openPrice)
+            ModifySL(openPrice);
+         else if(g_impulseDir == DIR_SHORT && (currentSL > openPrice || currentSL == 0))
+            ModifySL(openPrice);
       }
    }
-   else
+
+   // =====================================================================
+   // Exit優先順位3: EMAクロス（確定足＋1本確認）
+   // =====================================================================
    {
-      if(currentPrice > bandUpper)
+      // EMA値取得（確定足: shift=1, 1本前: shift=2）
+      double emaFast1 = GetExitEMA(g_exitEMAFastHandle, 1);  // 直近確定足
+      double emaSlow1 = GetExitEMA(g_exitEMASlowHandle, 1);
+      double emaFast2 = GetExitEMA(g_exitEMAFastHandle, 2);  // 1つ前の確定足
+      double emaSlow2 = GetExitEMA(g_exitEMASlowHandle, 2);
+
+      if(emaFast1 == 0.0 || emaSlow1 == 0.0 || emaFast2 == 0.0 || emaSlow2 == 0.0)
       {
-         ClosePosition("DeepRetrace");
-         g_stats.FinalState = "DeepRetrace";  // === ANALYZE追加 ===
-         ChangeState(STATE_COOLDOWN, "DeepRetrace");
+         // EMA取得失敗時はスキップ
          return;
+      }
+
+      if(g_exitPending)
+      {
+         // --- 確認フェーズ: クロス状態が維持されているか ---
+         g_exitPendingBars++;
+
+         bool crossMaintained = false;
+         string crossDir = "";
+
+         if(g_impulseDir == DIR_LONG)
+         {
+            // Long保有中: デッドクロス維持 = EMA_Fast < EMA_Slow
+            if(emaFast1 < emaSlow1)
+            {
+               crossMaintained = true;
+               crossDir = "DEAD";
+            }
+         }
+         else
+         {
+            // Short保有中: ゴールデンクロス維持 = EMA_Fast > EMA_Slow
+            if(emaFast1 > emaSlow1)
+            {
+               crossMaintained = true;
+               crossDir = "GOLDEN";
+            }
+         }
+
+         if(crossMaintained && g_exitPendingBars >= ExitConfirmBars)
+         {
+            // クロス確認完了 → 成行決済
+            g_stats.FinalState = "EMACross_Exit";
+            ClosePosition("EMACross",
+                     "ExitReason=EMA_CROSS;CrossDir=" + crossDir +
+                     ";EMA" + IntegerToString(ExitMAFastPeriod) + "=" + DoubleToString(emaFast1, digits) +
+                     ";EMA" + IntegerToString(ExitMASlowPeriod) + "=" + DoubleToString(emaSlow1, digits) +
+                     ";ConfirmBars=" + IntegerToString(g_exitPendingBars));
+            ChangeState(STATE_COOLDOWN, "EMACross_Exit");
+            return;
+         }
+         else if(!crossMaintained)
+         {
+            // クロス未維持 → ExitPending解除
+            g_exitPending     = false;
+            g_exitPendingBars = 0;
+         }
+      }
+      else
+      {
+         // --- 検出フェーズ: 新たなクロス発生をチェック ---
+         bool crossDetected = false;
+
+         if(g_impulseDir == DIR_LONG)
+         {
+            // Long保有中: デッドクロス = EMA_Fast がEMA_Slow を下抜け
+            if(emaFast2 >= emaSlow2 && emaFast1 < emaSlow1)
+               crossDetected = true;
+         }
+         else
+         {
+            // Short保有中: ゴールデンクロス = EMA_Fast がEMA_Slow を上抜け
+            if(emaFast2 <= emaSlow2 && emaFast1 > emaSlow1)
+               crossDetected = true;
+         }
+
+         if(crossDetected)
+         {
+            g_exitPending     = true;
+            g_exitPendingBars = 0;
+         }
       }
    }
 }
@@ -2777,6 +2893,10 @@ void ResetAllState()
 
    g_goldDeepBandON   = false;
    g_riskGateSoftPass = false;
+
+   // === CHANGE-008 === ExitPendingリセット
+   g_exitPending     = false;
+   g_exitPendingBars = 0;
    
    g_tradeUUID = "";
 }
@@ -3591,7 +3711,7 @@ void Process_TOUCH_2_WAIT_CONFIRM()
          double _egEntry = (g_impulseDir == DIR_LONG)
                            ? SymbolInfoDouble(Symbol(), SYMBOL_ASK)
                            : SymbolInfoDouble(Symbol(), SYMBOL_BID);
-         double _egTP = GetExtendedTP();   // CHANGE-006
+         double _egTP = GetExtendedTP();   // CHANGE-006: RangeCost評価用（理論TP）
          double _egSL = (g_impulseDir == DIR_LONG)
                         ? (g_impulseStart - _egAtr * g_profile.slATRMult)
                         : (g_impulseStart + _egAtr * g_profile.slATRMult);
@@ -3601,23 +3721,11 @@ void Process_TOUCH_2_WAIT_CONFIRM()
          double _egPoint  = SymbolInfoDouble(Symbol(), SYMBOL_POINT);
          double _egRR     = (_egRisk > _egPoint * 0.5) ? (_egReward / _egRisk) : 0.0;
 
-         // (a) MinRR check
-         if(_egRR < g_profile.minRR_EntryGate)
-         {
-            g_stats.RR_Actual   = _egRR;
-            g_stats.RejectStage = "RR_FAIL";
-            g_stats.FinalState  = "EntryGate_RR_Fail";
-            WriteLog(LOG_REJECT, "", "RR_FAIL",
-                     "RR=" + DoubleToString(_egRR, 3) +
-                     ";MinRR=" + DoubleToString(g_profile.minRR_EntryGate, 3) +
-                     ";Risk=" + DoubleToString(_egRisk, (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS)) +
-                     ";Reward=" + DoubleToString(_egReward, (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS)));
-            ChangeState(STATE_IDLE, "EntryGate_RR_Fail");
-            ResetAllState();
-            return;
-         }
+         // (a) CHANGE-008: MinRR check 廃止（RR Gate無効化）
+         // RR値は記録のみ行い、Rejectしない
+         g_stats.RR_Actual = _egRR;
 
-         // (b) MinRangeCostMult check
+         // (b) MinRangeCostMult check（維持）
          double _egSpread = SymbolInfoDouble(Symbol(), SYMBOL_ASK) - SymbolInfoDouble(Symbol(), SYMBOL_BID);
          double _egRangeCost = (_egSpread > 0.0) ? (_egReward / _egSpread) : 999.0;
          if(_egRangeCost < g_profile.minRangeCostMult)
@@ -3636,7 +3744,6 @@ void Process_TOUCH_2_WAIT_CONFIRM()
          }
 
          // EntryGate Pass → RR/RangeCostを記録
-         g_stats.RR_Actual            = _egRR;
          g_stats.RangeCostMult_Actual = _egRangeCost;
       }
 
@@ -4058,6 +4165,15 @@ int OnInit()
       return INIT_FAILED;
    }
 
+   // === CHANGE-008 === Exit EMAハンドル作成（M1固定）
+   g_exitEMAFastHandle = iMA(Symbol(), PERIOD_M1, ExitMAFastPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   g_exitEMASlowHandle = iMA(Symbol(), PERIOD_M1, ExitMASlowPeriod, 0, MODE_EMA, PRICE_CLOSE);
+   if(g_exitEMAFastHandle == INVALID_HANDLE || g_exitEMASlowHandle == INVALID_HANDLE)
+   {
+      Print("ERROR: Failed to create Exit EMA handles. Fast=", g_exitEMAFastHandle, " Slow=", g_exitEMASlowHandle);
+      return INIT_FAILED;
+   }
+
    // === 13.9.6 MA Confluence === SMAハンドル作成
    InitMAPeriods();
    for(int i = 0; i < MA_MAX_PERIODS; i++)
@@ -4117,6 +4233,18 @@ void OnDeinit(const int reason)
    {
       IndicatorRelease(g_atrHandleM1);
       g_atrHandleM1 = INVALID_HANDLE;
+   }
+
+   // === CHANGE-008 === Exit EMAハンドル解放
+   if(g_exitEMAFastHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_exitEMAFastHandle);
+      g_exitEMAFastHandle = INVALID_HANDLE;
+   }
+   if(g_exitEMASlowHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_exitEMASlowHandle);
+      g_exitEMASlowHandle = INVALID_HANDLE;
    }
 
    // === 13.9.6 MA Confluence === SMAハンドル解放
