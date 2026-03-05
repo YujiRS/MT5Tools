@@ -67,7 +67,7 @@ void WriteLog(int levelIndex, double closeLot, double closePrice)
 
    string line = TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS) + ","
                + gSymbol + ","
-               + IntegerToString(Ticket) + ","
+               + IntegerToString(gLastTicket) + ","
                + IntegerToString(levelIndex + 1) + ","
                + (gPosType == POSITION_TYPE_BUY ? "BUY" : "SELL") + ","
                + DoubleToString(closeLot, 2) + ","
@@ -105,6 +105,124 @@ void DrawLine(int index)
    ObjectSetInteger(0, lblName, OBJPROP_COLOR, lineColor);
    ObjectSetInteger(0, lblName, OBJPROP_FONTSIZE, 8);
    ObjectSetInteger(0, lblName, OBJPROP_ANCHOR, ANCHOR_LEFT_LOWER);
+}
+
+//================ STATE PERSISTENCE =================
+string StateFileName()
+{
+   return "PLC_state_" + IntegerToString(gPositionID) + ".txt";
+}
+
+string BuildParamLine()
+{
+   int digits = (int)SymbolInfoInteger(gSymbol, SYMBOL_DIGITS);
+   return IntegerToString(Ticket) + ","
+        + IntegerToString(CloseType) + ","
+        + DoubleToString(Level1_Price, digits) + ","
+        + DoubleToString(Level1_LotPercent, 1) + ","
+        + DoubleToString(Level2_Price, digits) + ","
+        + DoubleToString(Level2_LotPercent, 1) + ","
+        + DoubleToString(Level3_Price, digits) + ","
+        + DoubleToString(Level3_LotPercent, 1);
+}
+
+void SaveState()
+{
+   int h = FileOpen(StateFileName(), FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(h == INVALID_HANDLE)
+   {
+      Print("PartialLimitClose: 状態ファイル書き込み失敗 error=", GetLastError());
+      return;
+   }
+
+   // Line 1: input params snapshot
+   FileWriteString(h, BuildParamLine() + "\n");
+
+   // Line 2: original lot
+   FileWriteString(h, DoubleToString(gOrigLot, 2) + "\n");
+
+   // Line 3: done flags
+   string doneStr = "";
+   for(int i = 0; i < 3; i++)
+   {
+      if(i > 0) doneStr += ",";
+      doneStr += (i < gLevelCount && gLevels[i].done) ? "1" : "0";
+   }
+   FileWriteString(h, doneStr + "\n");
+
+   // Line 4: last ticket
+   FileWriteString(h, IntegerToString(gLastTicket) + "\n");
+
+   // Line 5: ticket history
+   FileWriteString(h, gTicketHistory + "\n");
+
+   FileClose(h);
+}
+
+bool LoadState()
+{
+   string fname = StateFileName();
+   if(!FileIsExist(fname)) return false;
+
+   int h = FileOpen(fname, FILE_READ | FILE_TXT | FILE_ANSI);
+   if(h == INVALID_HANDLE) return false;
+
+   // Line 1: check params match
+   string paramLine = "";
+   if(!FileIsEnding(h)) paramLine = FileReadString(h);
+   if(paramLine != BuildParamLine())
+   {
+      FileClose(h);
+      FileDelete(fname);
+      Print("PartialLimitClose: 状態ファイル パラメータ不一致 → 破棄");
+      return false;
+   }
+
+   // Line 2: original lot
+   string lotLine = "";
+   if(!FileIsEnding(h)) lotLine = FileReadString(h);
+   double savedOrigLot = StringToDouble(lotLine);
+   if(savedOrigLot <= 0.0)
+   {
+      FileClose(h);
+      FileDelete(fname);
+      return false;
+   }
+
+   // Line 3: done flags
+   string doneLine = "";
+   if(!FileIsEnding(h)) doneLine = FileReadString(h);
+   string doneArr[];
+   int cnt = StringSplit(doneLine, ',', doneArr);
+
+   // Line 4: last ticket
+   string ticketLine = "";
+   if(!FileIsEnding(h)) ticketLine = FileReadString(h);
+
+   // Line 5: ticket history
+   string histLine = "";
+   if(!FileIsEnding(h)) histLine = FileReadString(h);
+
+   FileClose(h);
+
+   // Apply restored state
+   gOrigLot = savedOrigLot;
+   for(int i = 0; i < gLevelCount && i < cnt; i++)
+      gLevels[i].done = (doneArr[i] == "1");
+
+   gLastTicket    = StringToInteger(ticketLine);
+   gTicketHistory = histLine;
+
+   Print("PartialLimitClose: 状態復元完了 OrigLot=", DoubleToString(gOrigLot, 2),
+         " LastTicket=", gLastTicket);
+   return true;
+}
+
+void DeleteStateFile()
+{
+   string fname = StateFileName();
+   if(FileIsExist(fname))
+      FileDelete(fname);
 }
 
 //================ CHART DISPLAY =================
@@ -193,6 +311,8 @@ bool ValidateLevels()
 
    for(int i = 0; i < gLevelCount; i++)
    {
+      if(gLevels[i].done) continue; // 復元済みレベルはスキップ
+
       double lvlPrice = gLevels[i].price;
       bool valid = false;
 
@@ -257,7 +377,9 @@ double CalcLots(int levelIndex)
    if(lots > remaining)
       lots = remaining;
 
-   return NormalizeDouble(lots, 2);
+   int lotDigits = (lotStep > 0) ? (int)MathRound(-MathLog10(lotStep)) : 2;
+   if(lotDigits < 0) lotDigits = 0;
+   return NormalizeDouble(lots, lotDigits);
 }
 
 //================ PARTIAL CLOSE EXECUTION =================
@@ -275,7 +397,7 @@ bool ExecutePartialClose(int levelIndex)
    request.symbol    = gSymbol;
    request.volume    = lots;
    request.type      = (gPosType == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-   request.position  = gPositionID;
+   request.position  = (ulong)gLastTicket;
    request.deviation = Slippage;
 
    if(gPosType == POSITION_TYPE_BUY)
@@ -287,6 +409,13 @@ bool ExecutePartialClose(int levelIndex)
    {
       Alert("PartialLimitClose: Level" + IntegerToString(levelIndex + 1)
           + " 決済失敗 エラー=" + IntegerToString(result.retcode));
+      return false;
+   }
+
+   // リクオート・価格変更は次ティックで再試行（Alertなし）
+   if(result.retcode == TRADE_RETCODE_REQUOTE || result.retcode == TRADE_RETCODE_PRICE_CHANGED)
+   {
+      Print("PartialLimitClose: リクオート発生、次ティックで再試行 retcode=", result.retcode);
       return false;
    }
 
@@ -309,6 +438,7 @@ bool ExecutePartialClose(int levelIndex)
       gLastTicket = curTicket;
    }
    UpdateChartDisplay();
+   SaveState();
 
    string msg = "PartialLimitClose: " + gSymbol
               + " Level" + IntegerToString(levelIndex + 1)
@@ -356,6 +486,9 @@ int OnInit()
    gOrigLot    = PositionGetDouble(POSITION_VOLUME);
    gSymbol     = PositionGetString(POSITION_SYMBOL);
 
+   if(gSymbol != _Symbol)
+      Alert("PartialLimitClose: ポジションのシンボル(" + gSymbol + ")とチャートのシンボル(" + _Symbol + ")が異なります。ティック監視が不正確になる可能性があります。");
+
    // レベル設定の解析
    double prices[3]   = { Level1_Price, Level2_Price, Level3_Price };
    double percents[3]  = { Level1_LotPercent, Level2_LotPercent, Level3_LotPercent };
@@ -384,13 +517,19 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   // 価格方向チェック
+   // 状態復元を試行（パラメータ一致時のみ復元）
+   bool stateRestored = LoadState();
+
+   // 価格方向チェック（復元済みレベルはスキップ）
    if(!ValidateLevels())
       return INIT_FAILED;
 
-   // チャートラインを描画
+   // チャートラインを描画（済みレベルはスキップ）
    for(int i = 0; i < gLevelCount; i++)
-      DrawLine(i);
+   {
+      if(!gLevels[i].done)
+         DrawLine(i);
+   }
    ChartRedraw(0);
 
    // ログファイルオープン
@@ -407,9 +546,12 @@ int OnInit()
       }
    }
 
-   // チケット履歴初期化
-   gTicketHistory = IntegerToString(Ticket);
-   gLastTicket    = Ticket;
+   // チケット履歴初期化（状態復元時は復元値を使用）
+   if(!stateRestored)
+   {
+      gTicketHistory = IntegerToString(Ticket);
+      gLastTicket    = Ticket;
+   }
 
    string posDir = (gPosType == POSITION_TYPE_BUY) ? "BUY" : "SELL";
    string ctStr  = (CloseType == CLOSE_TP) ? "TP" : "SL";
@@ -433,6 +575,7 @@ void OnTick()
    {
       Notify("PartialLimitClose: ポジションが外部で決済されました。EA終了します。"
            + " Symbol=" + gSymbol + " Ticket=" + IntegerToString(Ticket));
+      DeleteStateFile();
       ExpertRemove();
       return;
    }
@@ -480,6 +623,7 @@ void OnTick()
             {
                Notify("PartialLimitClose: 全決済完了。EA終了します。"
                     + " Symbol=" + gSymbol);
+               DeleteStateFile();
                ExpertRemove();
                return;
             }
@@ -494,6 +638,7 @@ void OnTick()
    {
       Notify("PartialLimitClose: 全レベル決済完了。EA終了します。"
            + " Symbol=" + gSymbol);
+      DeleteStateFile();
       ExpertRemove();
       return;
    }
