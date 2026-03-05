@@ -400,6 +400,15 @@ bool ExecutePartialClose(int levelIndex)
    request.position  = (ulong)gLastTicket;
    request.deviation = Slippage;
 
+   // Filling Modeをシンボル対応モードから自動設定
+   long fillMode = SymbolInfoInteger(gSymbol, SYMBOL_FILLING_MODE);
+   if((fillMode & SYMBOL_FILLING_FOK) != 0)
+      request.type_filling = ORDER_FILLING_FOK;
+   else if((fillMode & SYMBOL_FILLING_IOC) != 0)
+      request.type_filling = ORDER_FILLING_IOC;
+   else
+      request.type_filling = ORDER_FILLING_RETURN;
+
    if(gPosType == POSITION_TYPE_BUY)
       request.price = SymbolInfoDouble(gSymbol, SYMBOL_BID);
    else
