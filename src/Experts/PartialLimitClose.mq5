@@ -50,6 +50,8 @@ int            gLevelCount   = 0;
 LevelInfo      gLevels[3];
 int            gLogHandle    = INVALID_HANDLE;
 string         gObjPrefix    = "PLC_";
+string         gTicketHistory = "";
+long           gLastTicket    = 0;
 
 //================ UTILS =================
 void Notify(string msg)
@@ -103,6 +105,67 @@ void DrawLine(int index)
    ObjectSetInteger(0, lblName, OBJPROP_COLOR, lineColor);
    ObjectSetInteger(0, lblName, OBJPROP_FONTSIZE, 8);
    ObjectSetInteger(0, lblName, OBJPROP_ANCHOR, ANCHOR_LEFT_LOWER);
+}
+
+//================ CHART DISPLAY =================
+void UpdateChartDisplay()
+{
+   string posDir = (gPosType == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+   string ctStr  = (CloseType == CLOSE_TP) ? "TP" : "SL";
+
+   // Line 4 (top):    PLC | BUY-TP | PosID: 12345
+   string line4 = "PLC | " + posDir + "-" + ctStr + " | PosID: " + IntegerToString(gPositionID);
+
+   // Line 3:          Ticket: 67890 -> 67891(L1)
+   string line3 = "Ticket: " + gTicketHistory;
+
+   // Line 2:          Lot: 1.00 -> 0.60
+   double remainLot = 0.0;
+   if(FindPositionByID(gPositionID))
+      remainLot = PositionGetDouble(POSITION_VOLUME);
+   string line2 = "Lot: " + DoubleToString(gOrigLot, 2) + " -> " + DoubleToString(remainLot, 2);
+
+   // Line 1 (bottom): L1:済  L2:待機  L3:待機
+   string line1 = "";
+   for(int i = 0; i < gLevelCount; i++)
+   {
+      if(i > 0) line1 += "  ";
+      line1 += "L" + IntegerToString(i + 1) + ":";
+      line1 += gLevels[i].done ? "済" : "待機";
+   }
+
+   // index 0 = bottom-most
+   string lines[4];
+   lines[0] = line1;
+   lines[1] = line2;
+   lines[2] = line3;
+   lines[3] = line4;
+
+   for(int i = 0; i < 4; i++)
+   {
+      string name = gObjPrefix + "DSP" + IntegerToString(i);
+      if(ObjectFind(0, name) < 0)
+      {
+         ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0);
+         ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_LOWER);
+         ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_LOWER);
+         ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
+         ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 10);
+         ObjectSetString(0, name, OBJPROP_FONT, "Consolas");
+         ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      }
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, 15 + i * 18);
+      ObjectSetString(0, name, OBJPROP_TEXT, lines[i]);
+   }
+
+   ChartRedraw(0);
+}
+
+void RemoveDisplay()
+{
+   for(int i = 0; i < 4; i++)
+      ObjectDelete(0, gObjPrefix + "DSP" + IntegerToString(i));
 }
 
 void RemoveLine(int index)
@@ -169,7 +232,7 @@ double CalcLots(int levelIndex)
    // 残全部
    if(gLevels[levelIndex].lotPercent <= 0.0)
    {
-      if(!PositionSelectByTicket(Ticket)) return 0.0;
+      if(!FindPositionByID(gPositionID)) return 0.0;
       return PositionGetDouble(POSITION_VOLUME);
    }
 
@@ -189,7 +252,7 @@ double CalcLots(int levelIndex)
       lots = lotMax;
 
    // 現在の残ロットを超えないようにする
-   if(!PositionSelectByTicket(Ticket)) return 0.0;
+   if(!FindPositionByID(gPositionID)) return 0.0;
    double remaining = PositionGetDouble(POSITION_VOLUME);
    if(lots > remaining)
       lots = remaining;
@@ -237,6 +300,15 @@ bool ExecutePartialClose(int levelIndex)
    // 成功
    gLevels[levelIndex].done = true;
    RemoveLine(levelIndex);
+
+   // チケット履歴更新（部分決済後、残ポジションのチケットが変わる場合がある）
+   if(FindPositionByID(gPositionID))
+   {
+      long curTicket = (long)PositionGetInteger(POSITION_TICKET);
+      gTicketHistory += " -> " + IntegerToString(curTicket) + "(L" + IntegerToString(levelIndex + 1) + ")";
+      gLastTicket = curTicket;
+   }
+   UpdateChartDisplay();
 
    string msg = "PartialLimitClose: " + gSymbol
               + " Level" + IntegerToString(levelIndex + 1)
@@ -335,6 +407,10 @@ int OnInit()
       }
    }
 
+   // チケット履歴初期化
+   gTicketHistory = IntegerToString(Ticket);
+   gLastTicket    = Ticket;
+
    string posDir = (gPosType == POSITION_TYPE_BUY) ? "BUY" : "SELL";
    string ctStr  = (CloseType == CLOSE_TP) ? "TP" : "SL";
    Print("PartialLimitClose: 起動 Ticket=", Ticket,
@@ -342,6 +418,9 @@ int OnInit()
          " ", posDir, " ", ctStr,
          " OrigLot=", DoubleToString(gOrigLot, 2),
          " Levels=", gLevelCount);
+
+   // チャート左下に情報表示
+   UpdateChartDisplay();
 
    return INIT_SUCCEEDED;
 }
@@ -424,6 +503,7 @@ void OnTick()
 void OnDeinit(const int reason)
 {
    RemoveAllLines();
+   RemoveDisplay();
    ChartRedraw(0);
 
    if(gLogHandle != INVALID_HANDLE)
