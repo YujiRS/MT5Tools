@@ -407,7 +407,7 @@ bool ExecutePartialClose(int levelIndex)
    else if((fillMode & SYMBOL_FILLING_IOC) != 0)
       request.type_filling = ORDER_FILLING_IOC;
    else
-      request.type_filling = ORDER_FILLING_RETURN;
+      request.type_filling = ORDER_FILLING_FOK;
 
    if(gPosType == POSITION_TYPE_BUY)
       request.price = SymbolInfoDouble(gSymbol, SYMBOL_BID);
