@@ -52,6 +52,9 @@ input string SoundFile          = "alert.wav";
 //--- チャート表示 ---
 input bool   ShowArrows         = true;       // シグナル矢印表示
 
+//--- ログ設定 ---
+input bool   EnableTsvLog       = true;       // TSVログ出力
+
 //--- チャート描画用バッファ ---
 double BufFastEMA[];
 double BufSlowEMA[];
@@ -67,8 +70,18 @@ ENUM_TIMEFRAMES tfList[] = {PERIOD_M5, PERIOD_M15, PERIOD_H1, PERIOD_H4};
 int  hFast[TF_COUNT];          // 各TFの Fast MA ハンドル
 int  hSlow[TF_COUNT];          // 各TFの Slow MA ハンドル
 
-//--- 重複通知防止用（各TF × GC/DC）: [tfIdx][0=DC, 1=GC] ---
-datetime lastAlertTime[TF_COUNT][2];
+//--- 同方向クロス抑制用: 0=なし, 1=GC, -1=DC ---
+int lastCrossDir[TF_COUNT];
+
+//--- ATR ハンドル ---
+#define ATR_PERIOD     14
+int hATR[TF_COUNT];
+
+//--- SlopeAvg 計算本数 ---
+#define SLOPE_AVG_BARS 5
+
+//--- TSVログ用ファイルハンドル ---
+int logFileHandle = INVALID_HANDLE;
 
 //--- 矢印オブジェクトのプレフィックス ---
 const string arrowPrefix = "GCDC_Arrow_";
@@ -101,19 +114,6 @@ int GetSwingWindow(int idx)
       case 3: return SwingWindow_H4;
    }
    return 5;
-}
-
-//+------------------------------------------------------------------+
-//| 重複防止用の datetime を取得/設定                                |
-//+------------------------------------------------------------------+
-datetime GetLastAlertTime(int tfIdx, bool isGC)
-{
-   return lastAlertTime[tfIdx][isGC ? 1 : 0];
-}
-
-void SetLastAlertTime(int tfIdx, bool isGC, datetime dt)
-{
-   lastAlertTime[tfIdx][isGC ? 1 : 0] = dt;
 }
 
 //+------------------------------------------------------------------+
@@ -234,6 +234,135 @@ void CreateArrow(bool isGC, datetime time, double price, ENUM_TIMEFRAMES tf)
 }
 
 //+------------------------------------------------------------------+
+//| TSVログのヘッダ行を書き込む                                      |
+//+------------------------------------------------------------------+
+void WriteLogHeader()
+{
+   if(logFileHandle == INVALID_HANDLE) return;
+
+   string h = "LogTime\tSymbol\tSignal\tTimeframe\tBarTime"
+            + "\tClose\tHigh\tLow"
+            + "\tFastMA1\tFastMA2\tSlowMA1\tSlowMA2"
+            + "\tMaDiff\tSlopeFast\tSlopeSlow"
+            + "\tSlopeFastAvg5\tSlopeSlowAvg5"
+            + "\tSwingBarIndex\tSwingPrice\tSwingToCrossBars\tSwingToCrossDistance"
+            + "\tATR\tSpread"
+            + "\tM5_FastMA\tM5_SlowMA\tM5_MaDiff\tM5_SlopeFast\tM5_SlopeSlow"
+            + "\tM15_FastMA\tM15_SlowMA\tM15_MaDiff\tM15_SlopeFast\tM15_SlopeSlow"
+            + "\tH1_FastMA\tH1_SlowMA\tH1_MaDiff\tH1_SlopeFast\tH1_SlopeSlow"
+            + "\tH4_FastMA\tH4_SlowMA\tH4_MaDiff\tH4_SlopeFast\tH4_SlopeSlow"
+            + "\r\n";
+
+   FileWriteString(logFileHandle, h);
+}
+
+//+------------------------------------------------------------------+
+//| double 値を文字列に変換（ログ用）                                |
+//+------------------------------------------------------------------+
+string D(double value)
+{
+   return DoubleToString(value, _Digits);
+}
+
+//+------------------------------------------------------------------+
+//| TSVログ1行を書き込む                                             |
+//+------------------------------------------------------------------+
+void WriteLogEntry(bool isGC, datetime barTime, ENUM_TIMEFRAMES tf, int tfIdx,
+                   double closePrice, double highPrice, double lowPrice,
+                   double fastMA1, double fastMA2, double slowMA1, double slowMA2,
+                   int swingBarIdx, double swingPrice,
+                   const double &fastMA[], const double &slowMA[])
+{
+   if(logFileHandle == INVALID_HANDLE) return;
+
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   string sep = "\t";
+
+   // --- 基本情報 ---
+   string line = TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS)  // LogTime
+               + sep + _Symbol                                          // Symbol
+               + sep + (isGC ? "GC" : "DC")                            // Signal
+               + sep + TFToString(tf)                                   // Timeframe
+               + sep + TimeToString(barTime, TIME_DATE | TIME_MINUTES); // BarTime
+
+   // --- 価格データ ---
+   line += sep + D(closePrice) + sep + D(highPrice) + sep + D(lowPrice);
+
+   // --- MA 判定データ ---
+   line += sep + D(fastMA1) + sep + D(fastMA2) + sep + D(slowMA1) + sep + D(slowMA2);
+
+   double maDiff    = fastMA1 - slowMA1;
+   double slopeFast = fastMA1 - fastMA2;
+   double slopeSlow = slowMA1 - slowMA2;
+   line += sep + D(maDiff) + sep + D(slopeFast) + sep + D(slopeSlow);
+
+   // --- SlopeAvg（直近 SLOPE_AVG_BARS 本の平均傾き） ---
+   // 簡約: avg = (MA[1] - MA[1+N]) / N （テレスコーピング和）
+   int n = SLOPE_AVG_BARS;
+   if(ArraySize(fastMA) > n + 1 && ArraySize(slowMA) > n + 1)
+   {
+      double slopeFastAvg = (fastMA[1] - fastMA[1 + n]) / n;
+      double slopeSlowAvg = (slowMA[1] - slowMA[1 + n]) / n;
+      line += sep + D(slopeFastAvg) + sep + D(slopeSlowAvg);
+   }
+   else
+   {
+      line += sep + sep;
+   }
+
+   // --- Swing データ ---
+   int swingToCrossBars = swingBarIdx - 1;
+   double swingToCrossDist = MathAbs(closePrice - swingPrice);
+   line += sep + IntegerToString(swingBarIdx)
+         + sep + D(swingPrice)
+         + sep + IntegerToString(swingToCrossBars)
+         + sep + D(swingToCrossDist);
+
+   // --- ATR ---
+   double atrBuf[];
+   if(hATR[tfIdx] != INVALID_HANDLE && CopyBuffer(hATR[tfIdx], 0, 1, 1, atrBuf) == 1)
+      line += sep + D(atrBuf[0]);
+   else
+      line += sep;
+
+   // --- Spread ---
+   line += sep + IntegerToString((int)SymbolInfoInteger(_Symbol, SYMBOL_SPREAD));
+
+   // --- 他TFのMA状態（4TF分） ---
+   for(int i = 0; i < TF_COUNT; i++)
+   {
+      if(hFast[i] == INVALID_HANDLE || hSlow[i] == INVALID_HANDLE)
+      {
+         line += sep + sep + sep + sep + sep;
+         continue;
+      }
+
+      double tfFast[];
+      double tfSlow[];
+      ArraySetAsSeries(tfFast, true);
+      ArraySetAsSeries(tfSlow, true);
+
+      if(CopyBuffer(hFast[i], 0, 0, 2, tfFast) == 2 &&
+         CopyBuffer(hSlow[i], 0, 0, 2, tfSlow) == 2)
+      {
+         double tfMaDiff    = tfFast[0] - tfSlow[0];
+         double tfSlopeFast = tfFast[0] - tfFast[1];
+         double tfSlopeSlow = tfSlow[0] - tfSlow[1];
+         line += sep + D(tfFast[0]) + sep + D(tfSlow[0])
+               + sep + D(tfMaDiff) + sep + D(tfSlopeFast) + sep + D(tfSlopeSlow);
+      }
+      else
+      {
+         line += sep + sep + sep + sep + sep;
+      }
+   }
+
+   line += "\r\n";
+   FileWriteString(logFileHandle, line);
+   FileFlush(logFileHandle);
+}
+
+//+------------------------------------------------------------------+
 //| 特定時間足のクロス判定・フィルター・通知を実行                   |
 //+------------------------------------------------------------------+
 void CheckTimeframe(int tfIdx)
@@ -248,6 +377,9 @@ void CheckTimeframe(int tfIdx)
    // +3: IsSwingLow/High が center+strength まで参照するための余裕
    int minWindow = (swWindow > SwingWindow_H4) ? swWindow : SwingWindow_H4;
    int needBars = SwingStrength * 2 + minWindow + 5;
+   // SlopeAvg 計算にも十分な本数を確保
+   if(needBars < SLOPE_AVG_BARS + 5)
+      needBars = SLOPE_AVG_BARS + 5;
 
    // --- MA値取得 ---
    double fastMA[];
@@ -298,7 +430,8 @@ void CheckTimeframe(int tfIdx)
    // --- Swing 近辺フィルター ---
    // GC: 直近の Swing Low から swWindow 本以内にクロス発生
    // DC: 直近の Swing High から swWindow 本以内にクロス発生
-   bool swingFound = false;
+   int    swingBarIdx = -1;
+   double swingPrice  = 0.0;
 
    if(crossGC)
    {
@@ -308,7 +441,8 @@ void CheckTimeframe(int tfIdx)
       {
          if(IsSwingLow(low, s, SwingStrength, needBars))
          {
-            swingFound = true;
+            swingBarIdx = s;
+            swingPrice  = low[s];
             break;
          }
       }
@@ -319,26 +453,38 @@ void CheckTimeframe(int tfIdx)
       {
          if(IsSwingHigh(high, s, SwingStrength, needBars))
          {
-            swingFound = true;
+            swingBarIdx = s;
+            swingPrice  = high[s];
             break;
          }
       }
    }
 
-   if(!swingFound) return;
+   if(swingBarIdx < 0) return;
 
-   // --- 重複通知チェック ---
-   datetime barTime = time[1];  // クロス発生バーの時刻
+   // --- 同方向クロス抑制 ---
+   // 同じTFで同方向のクロスは、逆方向のクロスが発生するまで抑制する
    bool isGC = crossGC;
+   int currentDir = isGC ? 1 : -1;
 
-   if(GetLastAlertTime(tfIdx, isGC) == barTime) return;  // 同一バーでは通知済み
+   if(lastCrossDir[tfIdx] == currentDir) return;
+   lastCrossDir[tfIdx] = currentDir;
 
    // --- 通知実行 ---
-   SetLastAlertTime(tfIdx, isGC, barTime);
-
-   double closePrice = close[1];
-   string message = BuildMessage(isGC, barTime, closePrice, tf);
+   datetime barTime   = time[1];
+   double closePrice  = close[1];
+   string message     = BuildMessage(isGC, barTime, closePrice, tf);
    SendSignalNotification(message);
+
+   // --- TSVログ出力 ---
+   if(EnableTsvLog)
+   {
+      WriteLogEntry(isGC, barTime, tf, tfIdx,
+                    closePrice, high[1], low[1],
+                    fastMA[1], fastMA[2], slowMA[1], slowMA[2],
+                    swingBarIdx, swingPrice,
+                    fastMA, slowMA);
+   }
 
    // --- 矢印表示（チャート時間足と一致する場合のみ） ---
    if(tf == (ENUM_TIMEFRAMES)ChartPeriod(0))
@@ -364,8 +510,8 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    }
 
-   // --- 重複通知防止用配列を初期化 ---
-   ArrayInitialize(lastAlertTime, 0);
+   // --- 同方向クロス抑制用配列を初期化 ---
+   ArrayFill(lastCrossDir, 0, TF_COUNT, 0);
 
    // --- チャート描画用バッファ設定 ---
    SetIndexBuffer(0, BufFastEMA, INDICATOR_DATA);
@@ -384,24 +530,49 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   // --- 4TF 監視用 MA ハンドルをキャッシュ ---
+   // --- 4TF 監視用 MA ハンドルおよび ATR ハンドルをキャッシュ ---
    for(int i = 0; i < TF_COUNT; i++)
    {
       if(IsTFEnabled(i))
       {
          hFast[i] = iMA(_Symbol, tfList[i], EMA_Fast, 0, maMethod, PRICE_CLOSE);
          hSlow[i] = iMA(_Symbol, tfList[i], EMA_Slow, 0, maMethod, PRICE_CLOSE);
+         hATR[i]  = iATR(_Symbol, tfList[i], ATR_PERIOD);
 
          if(hFast[i] == INVALID_HANDLE || hSlow[i] == INVALID_HANDLE)
          {
             PrintFormat("Error: TF=%s のMAハンドル作成に失敗しました", TFToString(tfList[i]));
             return INIT_FAILED;
          }
+         if(hATR[i] == INVALID_HANDLE)
+         {
+            PrintFormat("Warning: TF=%s のATRハンドル作成に失敗しました", TFToString(tfList[i]));
+         }
       }
       else
       {
          hFast[i] = INVALID_HANDLE;
          hSlow[i] = INVALID_HANDLE;
+         hATR[i]  = INVALID_HANDLE;
+      }
+   }
+
+   // --- TSVログファイルを開く ---
+   if(EnableTsvLog)
+   {
+      string filename = "GC_DC_SwingNotifier_" + _Symbol + ".tsv";
+      bool fileExists = FileIsExist(filename);
+      logFileHandle = FileOpen(filename, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI);
+
+      if(logFileHandle != INVALID_HANDLE)
+      {
+         if(!fileExists)
+            WriteLogHeader();
+         FileSeek(logFileHandle, 0, SEEK_END);
+      }
+      else
+      {
+         PrintFormat("Warning: TSVログファイルを開けませんでした: %s", filename);
       }
    }
 
@@ -453,6 +624,13 @@ int OnCalculate(const int rates_total, const int prev_calculated,
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   // TSVログファイルを閉じる
+   if(logFileHandle != INVALID_HANDLE)
+   {
+      FileClose(logFileHandle);
+      logFileHandle = INVALID_HANDLE;
+   }
+
    // チャート用ハンドル解放
    if(hChartFast != INVALID_HANDLE) IndicatorRelease(hChartFast);
    if(hChartSlow != INVALID_HANDLE) IndicatorRelease(hChartSlow);
@@ -462,6 +640,7 @@ void OnDeinit(const int reason)
    {
       if(hFast[i] != INVALID_HANDLE) IndicatorRelease(hFast[i]);
       if(hSlow[i] != INVALID_HANDLE) IndicatorRelease(hSlow[i]);
+      if(hATR[i]  != INVALID_HANDLE) IndicatorRelease(hATR[i]);
    }
 
    // 矢印オブジェクト削除
