@@ -83,6 +83,9 @@ int hATR[TF_COUNT];
 //--- TSVログ用ファイルハンドル ---
 int logFileHandle = INVALID_HANDLE;
 
+//--- OnDeinit 理由保存（TF変更時の通知再送防止用） ---
+int lastDeinitReason = -1;
+
 //--- 矢印オブジェクトのプレフィックス ---
 const string arrowPrefix = "GCDC_Arrow_";
 
@@ -511,7 +514,10 @@ int OnInit()
    }
 
    // --- 同方向クロス抑制用配列を初期化 ---
-   ArrayFill(lastCrossDir, 0, TF_COUNT, 0);
+   // TF変更（REASON_CHARTCHANGE）時は監視対象TF（M5/M15/H1/H4）が変わらないため
+   // 抑制状態を保持し、同一シグナルの再通知を防止する
+   if(lastDeinitReason != REASON_CHARTCHANGE)
+      ArrayFill(lastCrossDir, 0, TF_COUNT, 0);
 
    // --- チャート描画用バッファ設定 ---
    SetIndexBuffer(0, BufFastEMA, INDICATOR_DATA);
@@ -624,6 +630,9 @@ int OnCalculate(const int rates_total, const int prev_calculated,
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
+   // OnDeinit 理由を保存（次回 OnInit で参照）
+   lastDeinitReason = reason;
+
    // TSVログファイルを閉じる
    if(logFileHandle != INVALID_HANDLE)
    {
@@ -632,15 +641,15 @@ void OnDeinit(const int reason)
    }
 
    // チャート用ハンドル解放
-   if(hChartFast != INVALID_HANDLE) IndicatorRelease(hChartFast);
-   if(hChartSlow != INVALID_HANDLE) IndicatorRelease(hChartSlow);
+   if(hChartFast != INVALID_HANDLE) { IndicatorRelease(hChartFast); hChartFast = INVALID_HANDLE; }
+   if(hChartSlow != INVALID_HANDLE) { IndicatorRelease(hChartSlow); hChartSlow = INVALID_HANDLE; }
 
    // 4TF用ハンドル解放
    for(int i = 0; i < TF_COUNT; i++)
    {
-      if(hFast[i] != INVALID_HANDLE) IndicatorRelease(hFast[i]);
-      if(hSlow[i] != INVALID_HANDLE) IndicatorRelease(hSlow[i]);
-      if(hATR[i]  != INVALID_HANDLE) IndicatorRelease(hATR[i]);
+      if(hFast[i] != INVALID_HANDLE) { IndicatorRelease(hFast[i]); hFast[i] = INVALID_HANDLE; }
+      if(hSlow[i] != INVALID_HANDLE) { IndicatorRelease(hSlow[i]); hSlow[i] = INVALID_HANDLE; }
+      if(hATR[i]  != INVALID_HANDLE) { IndicatorRelease(hATR[i]);  hATR[i]  = INVALID_HANDLE; }
    }
 
    // 矢印オブジェクト削除
