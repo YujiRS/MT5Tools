@@ -261,7 +261,7 @@ void WriteLogHeader()
 //+------------------------------------------------------------------+
 string D(double value)
 {
-   return DoubleToString(value, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+   return DoubleToString(value, _Digits);
 }
 
 //+------------------------------------------------------------------+
