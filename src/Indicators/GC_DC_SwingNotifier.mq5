@@ -83,11 +83,23 @@ int hATR[TF_COUNT];
 //--- TSVログ用ファイルハンドル ---
 int logFileHandle = INVALID_HANDLE;
 
-//--- OnDeinit 理由保存（TF変更時の通知再送防止用） ---
-int lastDeinitReason = -1;
-
 //--- 矢印オブジェクトのプレフィックス ---
 const string arrowPrefix = "GCDC_Arrow_";
+
+//+------------------------------------------------------------------+
+//| GlobalVariable名を生成（同方向クロス抑制状態の永続化用）         |
+//| ファイルスコープ変数はインジケーター再初期化時にリセットされる    |
+//| 場合があるため、ターミナルレベルの GlobalVariable で状態を保持    |
+//+------------------------------------------------------------------+
+string GVarCrossDirName(int tfIdx)
+{
+   return "GCDC_" + IntegerToString(ChartID()) + "_D" + IntegerToString(tfIdx);
+}
+
+string GVarDeinitReasonName()
+{
+   return "GCDC_" + IntegerToString(ChartID()) + "_R";
+}
 
 //+------------------------------------------------------------------+
 //| TFインデックスから使用フラグを取得                               |
@@ -472,6 +484,7 @@ void CheckTimeframe(int tfIdx)
 
    if(lastCrossDir[tfIdx] == currentDir) return;
    lastCrossDir[tfIdx] = currentDir;
+   GlobalVariableSet(GVarCrossDirName(tfIdx), (double)currentDir);
 
    // --- 通知実行 ---
    datetime barTime   = time[1];
@@ -516,8 +529,34 @@ int OnInit()
    // --- 同方向クロス抑制用配列を初期化 ---
    // TF変更（REASON_CHARTCHANGE）時は監視対象TF（M5/M15/H1/H4）が変わらないため
    // 抑制状態を保持し、同一シグナルの再通知を防止する
-   if(lastDeinitReason != REASON_CHARTCHANGE)
-      ArrayFill(lastCrossDir, 0, TF_COUNT, 0);
+   //
+   // ファイルスコープ変数はインジケーターの再初期化時に初期値にリセットされる
+   // 場合があるため、GlobalVariable（ターミナルレベル）で確実に状態を引き継ぐ
+   {
+      double storedReason = -1.0;
+      bool isChartChange = GlobalVariableGet(GVarDeinitReasonName(), storedReason)
+                           && ((int)storedReason == REASON_CHARTCHANGE);
+      // 参照済みの Deinit reason GV を削除
+      GlobalVariableDel(GVarDeinitReasonName());
+
+      if(isChartChange)
+      {
+         // TF変更: GlobalVariable から lastCrossDir を復元
+         for(int i = 0; i < TF_COUNT; i++)
+         {
+            double val = 0.0;
+            if(GlobalVariableGet(GVarCrossDirName(i), val))
+               lastCrossDir[i] = (int)val;
+         }
+      }
+      else
+      {
+         ArrayFill(lastCrossDir, 0, TF_COUNT, 0);
+         // GlobalVariable もクリア
+         for(int i = 0; i < TF_COUNT; i++)
+            GlobalVariableDel(GVarCrossDirName(i));
+      }
+   }
 
    // --- チャート描画用バッファ設定 ---
    SetIndexBuffer(0, BufFastEMA, INDICATOR_DATA);
@@ -630,8 +669,22 @@ int OnCalculate(const int rates_total, const int prev_calculated,
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   // OnDeinit 理由を保存（次回 OnInit で参照）
-   lastDeinitReason = reason;
+   // 状態を GlobalVariable に永続化（ファイルスコープ変数がリセットされる場合の対策）
+   // TF変更時のみ保存（他の理由ではクリアして状態をリセット）
+   if(reason == REASON_CHARTCHANGE)
+   {
+      // 次回 OnInit で参照するため、deinit理由と lastCrossDir を保存
+      GlobalVariableSet(GVarDeinitReasonName(), (double)reason);
+      for(int i = 0; i < TF_COUNT; i++)
+         GlobalVariableSet(GVarCrossDirName(i), (double)lastCrossDir[i]);
+   }
+   else
+   {
+      // TF変更以外（パラメータ変更、削除、ターミナル終了等）は GlobalVariable をクリア
+      for(int i = 0; i < TF_COUNT; i++)
+         GlobalVariableDel(GVarCrossDirName(i));
+      GlobalVariableDel(GVarDeinitReasonName());
+   }
 
    // TSVログファイルを閉じる
    if(logFileHandle != INVALID_HANDLE)
